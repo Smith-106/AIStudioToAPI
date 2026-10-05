@@ -342,7 +342,7 @@ class RequestHandler {
                 );
             } else if (format === "response_api") {
                 // OpenAI Response API format: event: error\ndata: {...}
-                if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+                if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
                 res.__responseApiSeq += 1;
                 res.write(
                     `event: error\ndata: ${JSON.stringify({
@@ -424,7 +424,7 @@ class RequestHandler {
                         sequence_number: 0,
                         type: "error",
                     };
-                    if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+                    if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
                     res.__responseApiSeq += 1;
                     errorPayload.sequence_number = res.__responseApiSeq;
                     if (this._isResponseWritable(res)) {
@@ -478,7 +478,7 @@ class RequestHandler {
                         sequence_number: 0,
                         type: "error",
                     };
-                    if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+                    if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
                     res.__responseApiSeq += 1;
                     errorPayload.sequence_number = res.__responseApiSeq;
                     if (this._isResponseWritable(res)) {
@@ -1518,6 +1518,7 @@ class RequestHandler {
                 return chunks.length > 0 ? chunks.join("\n") : null;
             };
             const responseDefaultsRaw = {
+                include: Array.isArray(req.body?.include) ? req.body.include : undefined,
                 instructions: normalizeInstructions(req.body?.instructions),
                 max_output_tokens: req.body?.max_output_tokens ?? null,
                 metadata:
@@ -1561,12 +1562,13 @@ class RequestHandler {
             }
 
             // Translate OpenAI Response format to Google format
-            let googleBody, model, modelStreamingMode;
+            let googleBody, model, modelStreamingMode, responseFunctionNameMap;
             try {
                 const result = await this.formatConverter.translateOpenAIResponseToGoogle(req.body);
                 googleBody = result.googleRequest;
                 model = result.cleanModelName;
                 modelStreamingMode = result.modelStreamingMode || null;
+                responseFunctionNameMap = result.responseFunctionNameMap || {};
             } catch (error) {
                 this.logger.error(
                     `❌ [Adapter] OpenAI Response request translation failed: ${error.message}, request ID: ${requestId}`
@@ -1710,6 +1712,7 @@ class RequestHandler {
                     await this._streamOpenAIResponseAPIResponse(currentQueue, res, model, {
                         requestId,
                         responseDefaults,
+                        responseFunctionNameMap,
                     });
                 } else {
                     // OpenAI Response API Fake Stream / Non-Stream mode
@@ -1792,7 +1795,7 @@ class RequestHandler {
 
                             this.logger.info(`[Request] OpenAI Response API streaming response (Fake Mode) started...`);
                             let fullBody = "";
-                            if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+                            if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
                             let hadStreamError = false;
                             try {
                                 // eslint-disable-next-line no-constant-condition
@@ -1840,11 +1843,14 @@ class RequestHandler {
 
                                 const streamState = {};
                                 streamState.responseDefaults = responseDefaults;
+                                streamState.responseFunctionNameMap = responseFunctionNameMap;
                                 const translatedChunk = this.formatConverter.translateGoogleToResponseAPIStream(
                                     fullBody,
                                     model,
                                     streamState
                                 );
+                                if (streamState.error)
+                                    this._markTrackedResponseError(res, streamState.error.message, 400);
                                 if (this._isResponseWritable(res)) {
                                     try {
                                         if (translatedChunk) {
@@ -1874,7 +1880,8 @@ class RequestHandler {
                                 res,
                                 model,
                                 requestId,
-                                responseDefaults
+                                responseDefaults,
+                                responseFunctionNameMap
                             );
                         }
                     } finally {
@@ -2189,6 +2196,8 @@ class RequestHandler {
                                     model,
                                     streamState
                                 );
+                                if (streamState.error)
+                                    this._markTrackedResponseError(res, streamState.error.message, 400);
                                 if (this._isResponseWritable(res)) {
                                     try {
                                         if (translatedChunk) {
@@ -2583,6 +2592,7 @@ class RequestHandler {
                         model,
                         streamState
                     );
+                    if (streamState.error) this._markTrackedResponseError(res, streamState.error.message, 400);
                     if (claudeChunk) {
                         // Before writing, ensure the response is still writable to avoid
                         // throwing if the client disconnected mid-stream.
@@ -2602,6 +2612,7 @@ class RequestHandler {
                             break;
                         }
                     }
+                    if (streamState.error) break;
                 }
             }
         } catch (error) {
@@ -3481,10 +3492,11 @@ class RequestHandler {
     async _streamOpenAIResponseAPIResponse(messageQueue, res, model, streamOptions = {}) {
         const streamState = {
             responseDefaults: streamOptions.responseDefaults || {},
+            responseFunctionNameMap: streamOptions.responseFunctionNameMap || {},
         };
         const requestId = streamOptions.requestId;
         // Keep Response API sequence numbers consistent across helpers that might write to the same SSE response.
-        if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+        if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
         streamState.sequenceNumber = res.__responseApiSeq;
 
         try {
@@ -3503,7 +3515,7 @@ class RequestHandler {
                     this._markTrackedResponseError(res, message.message, 500);
                     if (this._isResponseWritable(res)) {
                         try {
-                            if (!streamState.sequenceNumber) streamState.sequenceNumber = 0;
+                            if (!Number.isInteger(streamState.sequenceNumber)) streamState.sequenceNumber = -1;
                             streamState.sequenceNumber++;
                             res.__responseApiSeq = streamState.sequenceNumber;
                             res.write(
@@ -3530,6 +3542,7 @@ class RequestHandler {
                         model,
                         streamState
                     );
+                    if (streamState.error) this._markTrackedResponseError(res, streamState.error.message, 400);
                     if (typeof streamState.sequenceNumber === "number") {
                         res.__responseApiSeq = streamState.sequenceNumber;
                     }
@@ -3549,6 +3562,7 @@ class RequestHandler {
                             break;
                         }
                     }
+                    if (streamState.error) break;
                 }
             }
         } catch (error) {
@@ -3640,7 +3654,14 @@ class RequestHandler {
         }
     }
 
-    async _sendOpenAIResponseAPINonStreamResponse(messageQueue, res, model, requestId, responseDefaults = {}) {
+    async _sendOpenAIResponseAPINonStreamResponse(
+        messageQueue,
+        res,
+        model,
+        requestId,
+        responseDefaults = {},
+        responseFunctionNameMap = {}
+    ) {
         let fullBody = "";
         let receiving = true;
         while (receiving) {
@@ -3670,7 +3691,8 @@ class RequestHandler {
             const responseAPIResponse = this.formatConverter.convertGoogleToResponseAPINonStream(
                 googleResponse,
                 model,
-                responseDefaults
+                responseDefaults,
+                responseFunctionNameMap
             );
             res.type("application/json").send(JSON.stringify(responseAPIResponse));
             this.logger.info(
@@ -3818,7 +3840,7 @@ class RequestHandler {
                         this._markTrackedResponseError(res, errorMessage, errorCode);
 
                         if (format === "response_api") {
-                            if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+                            if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
                             res.__responseApiSeq += 1;
                             res.write(
                                 `event: error\ndata: ${JSON.stringify({
@@ -3985,7 +4007,7 @@ class RequestHandler {
         if (this._isResponseWritable(res)) {
             try {
                 if (format === "response_api") {
-                    if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
+                    if (res.__responseApiSeq == null) res.__responseApiSeq = -1;
                     res.__responseApiSeq += 1;
                     res.write(
                         `event: error\ndata: ${JSON.stringify({
@@ -4234,7 +4256,7 @@ class RequestHandler {
 
         // Pre-process native Google requests
         // 1. Ensure thoughtSignature for functionCall (not functionResponse)
-        // 2. Sanitize tools (remove unsupported fields, convert type to uppercase)
+        // 2. Normalize type values in legacy tool parameters to uppercase Gemini Type enums
         // 3. Normalize responseSchema type values to Google Type enums
         if (req.method === "POST" && bodyObj) {
             if (bodyObj.contents) {
