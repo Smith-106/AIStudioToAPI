@@ -34,7 +34,16 @@ class RequestHandler {
 
         // Initialize sub-modules
         this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
-        this.formatConverter = new FormatConverter(logger, serverSystem);
+        // index.js mounts the API modules onto this instance's prototype at runtime.
+        this.formatConverter = /** @type {FormatConverter &
+         * import("./FormatConverter/ChatCompletionsConverter") &
+         * import("./FormatConverter/EmbeddingsConverter") &
+         * import("./FormatConverter/ClaudeRequestConverter") &
+         * import("./FormatConverter/ClaudeResponseConverter") &
+         * import("./FormatConverter/ResponsesRequestConverter") &
+         * import("./FormatConverter/ResponsesStreamResponseConverter") &
+         * import("./FormatConverter/ResponsesNonStreamResponseConverter")}
+         */ (new FormatConverter(logger, serverSystem));
 
         this.needsSwitchingAfterRequest = false;
 
@@ -242,8 +251,7 @@ class RequestHandler {
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
             if (!this.connectionRegistry.isInGracePeriod() && !this.connectionRegistry.isReconnectingInProgress()) {
-                const connectionReady = await this._waitForConnection(WS_CONNECTION_READY_TIMEOUT_MS);
-                return connectionReady;
+                return await this._waitForConnection(WS_CONNECTION_READY_TIMEOUT_MS);
             }
             await new Promise(resolve => setTimeout(resolve, 100));
         }
@@ -3168,8 +3176,7 @@ class RequestHandler {
                 }
             }
 
-            const fullBodyBuffer = Buffer.concat(chunks);
-            let responseBodyBuffer = fullBodyBuffer;
+            let responseBodyBuffer = Buffer.concat(chunks);
 
             try {
                 const fullResponse = JSON.parse(responseBodyBuffer.toString());
@@ -4182,39 +4189,19 @@ class RequestHandler {
             const pathSuffix = modelPathMatch[3];
 
             const {
-                cleanModelName: toolStrippedModel,
+                cleanModelName,
                 forceCodeExecution: parsedForceCodeExecution,
                 forceWebSearch: parsedForceWebSearch,
-            } = FormatConverter.parseModelBuiltInToolSuffixes(rawModelName);
-            const { cleanModelName: streamStrippedModel, streamingMode: parsedStreamingMode } =
-                FormatConverter.parseModelStreamingModeSuffix(toolStrippedModel);
-            const { cleanModelName, thinkingLevel: parsedThinkingLevel } =
-                FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+                streamingMode: parsedStreamingMode,
+                thinkingLevel: parsedThinkingLevel,
+            } = this.formatConverter.parseModelSuffixes(rawModelName, {
+                logPrefix: "[Proxy]",
+                modelSource: "model path",
+            });
             modelForceCodeExecution = parsedForceCodeExecution;
             modelForceWebSearch = parsedForceWebSearch;
             modelStreamingMode = parsedStreamingMode;
             modelThinkingLevel = parsedThinkingLevel;
-
-            const modelForceToolFlags = [];
-            if (modelForceWebSearch) modelForceToolFlags.push("forceWebSearch=true");
-            if (modelForceCodeExecution) modelForceToolFlags.push("forceCodeExecution=true");
-            if (modelForceToolFlags.length > 0) {
-                this.logger.info(
-                    `[Proxy] Detected built-in tool suffixes in model path: "${rawModelName}" -> model="${toolStrippedModel}", ${modelForceToolFlags.join(", ")}`
-                );
-            }
-
-            if (modelStreamingMode) {
-                this.logger.info(
-                    `[Proxy] Detected streamingMode suffix in model path: "${toolStrippedModel}" -> model="${streamStrippedModel}", streamingMode="${modelStreamingMode}"`
-                );
-            }
-
-            if (modelThinkingLevel) {
-                this.logger.info(
-                    `[Proxy] Detected thinkingLevel suffix in model path: "${streamStrippedModel}" -> model="${cleanModelName}", thinkingLevel="${modelThinkingLevel}"`
-                );
-            }
 
             // Always strip recognized directives from path model name
             if (cleanModelName !== rawModelName) {
@@ -4249,9 +4236,6 @@ class RequestHandler {
             }
             // Model name suffix thinkingLevel has highest priority, direct override
             bodyObj.generationConfig.thinkingConfig.thinkingLevel = modelThinkingLevel;
-            this.logger.info(
-                `[Proxy] Applied thinkingLevel from model name suffix: ${modelThinkingLevel} (Google Native)`
-            );
         }
 
         // Pre-process native Google requests
