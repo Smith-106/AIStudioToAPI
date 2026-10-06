@@ -420,37 +420,6 @@ class RequestProcessor {
         }
     }
 
-    _isJsonOutput(bodyObj) {
-        const schemaKeys = [
-            "responseSchema",
-            "response_schema",
-            "responseJsonSchema",
-            "response_json_schema",
-            "_responseJsonSchema",
-            "_response_json_schema",
-        ];
-        return [bodyObj.generationConfig, bodyObj.generation_config].some(generationConfig => {
-            if (!generationConfig || typeof generationConfig !== "object") {
-                return false;
-            }
-            if (
-                generationConfig.responseMimeType === "application/json" ||
-                generationConfig.response_mime_type === "application/json" ||
-                schemaKeys.some(key => Object.prototype.hasOwnProperty.call(generationConfig, key))
-            ) {
-                return true;
-            }
-            return [generationConfig.responseFormat, generationConfig.response_format].some(format => {
-                const text = format?.text;
-                return (
-                    text &&
-                    (Object.prototype.hasOwnProperty.call(text, "schema") ||
-                        ["APPLICATION_JSON", "application/json", 1].includes(text.mimeType ?? text.mime_type))
-                );
-            });
-        });
-    }
-
     _buildRequestConfig(requestSpec, signal) {
         const config = {
             headers: this._sanitizeHeaders(requestSpec.headers, requestSpec),
@@ -572,27 +541,6 @@ class RequestProcessor {
                     if (isRoboticsModel) {
                         if (bodyObj.generationConfig?.responseModalities) {
                             delete bodyObj.generationConfig.responseModalities;
-                        }
-                    }
-
-                    // --- Module 4: Gemini 2 JSON Mode Tool Filtering ---
-                    // If model starts with gemini-2 and response format is JSON, remove tools/toolConfig
-                    // This prevents 400 errors as some Gemini 2 variants don't support combined Tool + Structured Output
-                    const isGemini2 = requestSpec.path.match(/\/models\/gemini-2/);
-                    const isJsonMode = this._isJsonOutput(bodyObj);
-
-                    if (isGemini2 && isJsonMode) {
-                        let keysRemoved = 0;
-                        toolRelatedKeys.forEach(key => {
-                            if (Object.prototype.hasOwnProperty.call(bodyObj, key)) {
-                                delete bodyObj[key];
-                                keysRemoved++;
-                            }
-                        });
-                        if (keysRemoved > 0) {
-                            Logger.output(
-                                `Gemini 2/2.5 + JSON mode detected, automatically filtering tool parameter to prevent API error`
-                            );
                         }
                     }
 
